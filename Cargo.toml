@@ -1,0 +1,22 @@
+[package]
+name = "sync-clipboard"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+zstd = "0.13"
+sha2 = "0.10"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-clipboard-listener = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = { version = "5.4", features = ["monitor"] }

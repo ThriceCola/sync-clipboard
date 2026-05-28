@@ -1,0 +1,397 @@
+//! Platform-abstracted clipboard operations.
+//!
+//! Each platform provides three functions behind a common interface:
+//! - `read_once()` - read current clipboard (one-shot)
+//! - `set_content()` - write to clipboard
+//! - `start_monitor()` - spawn a background thread that sends changes via channel
+
+use crate::message::ClipboardContent;
+use std::sync::mpsc::Sender;
+
+// ---- Linux (Wayland) implementation ----
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::*;
+    use std::thread;
+    use wayland_clipboard_listener::{
+        ClipBoardListenContext, WlClipboardCopyStream, WlClipboardPasteStream, WlListenType,
+    };
+
+    const TEXT_MIMES: &[&str] = &[
+        "UTF8_STRING",
+        "TEXT",
+        "STRING",
+        "text/plain",
+        "text/plain;charset=utf-8",
+    ];
+
+    fn is_text_mime(mime: &str) -> bool {
+        mime.starts_with("text/")
+            || TEXT_MIMES.contains(&mime)
+            || mime == "STRING"
+            || mime == "TEXT"
+            || mime == "UTF8_STRING"
+    }
+
+    fn context_to_content(ctx: ClipBoardListenContext) -> Option<ClipboardContent> {
+        if ctx.context.is_empty() {
+            return None;
+        }
+        if is_text_mime(&ctx.mime_type) {
+            let text = String::from_utf8_lossy(&ctx.context).to_string();
+            Some(ClipboardContent::Text(text))
+        } else {
+            Some(ClipboardContent::Image {
+                mime_type: ctx.mime_type,
+                data: ctx.context,
+            })
+        }
+    }
+
+    fn content_is_empty(content: &ClipboardContent) -> bool {
+        match content {
+            ClipboardContent::Text(s) => s.is_empty(),
+            ClipboardContent::Image { data, .. } => data.is_empty(),
+        }
+    }
+
+    pub fn set_content(content: ClipboardContent) {
+        if content_is_empty(&content) {
+            return;
+        }
+        thread::spawn(move || {
+            let mut stream = match WlClipboardCopyStream::init() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to init copy stream: {e}");
+                    return;
+                }
+            };
+
+            let result = match &content {
+                ClipboardContent::Text(s) => {
+                    let data = s.as_bytes().to_vec();
+                    stream.copy_to_clipboard(
+                        data,
+                        vec!["UTF8_STRING", "TEXT", "STRING", "text/plain"],
+                        false,
+                    )
+                }
+                ClipboardContent::Image { mime_type, data } => {
+                    stream.copy_to_clipboard(data.clone(), vec![mime_type.as_str()], false)
+                }
+            };
+
+            if let Err(e) = result {
+                log::error!("Failed to set clipboard: {e}");
+            }
+        });
+    }
+
+    pub fn start_monitor(sender: Sender<ClipboardContent>) {
+        thread::spawn(move || {
+            let mut stream = match WlClipboardPasteStream::init(WlListenType::ListenOnCopy) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to init Wayland clipboard listener: {e}");
+                    return;
+                }
+            };
+
+            log::info!("Wayland clipboard monitor started");
+
+            for msg in stream.paste_stream().flatten() {
+                if let Some(content) = context_to_content(msg.context) {
+                    log::debug!("Clipboard changed: {:?}", content);
+                    if sender.send(content).is_err() {
+                        log::info!("Clipboard monitor channel closed, exiting");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Read content from clipboard once (used for dedup after remote set).
+    pub fn read_once() -> Option<ClipboardContent> {
+        let mut stream = WlClipboardPasteStream::init(WlListenType::ListenOnCopy).ok()?;
+        let msg = stream.get_clipboard().ok()?;
+        context_to_content(msg.context)
+    }
+}
+
+// ---- Windows implementation ----
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use super::*;
+    use clipboard_win::{Clipboard, Monitor, Setter, formats, get_clipboard, set_clipboard_string};
+    use image::ExtendedColorType;
+    use image::codecs::bmp::BmpEncoder;
+    use std::sync::OnceLock;
+    use std::thread;
+
+    fn content_is_empty(content: &ClipboardContent) -> bool {
+        match content {
+            ClipboardContent::Text(s) => s.is_empty(),
+            ClipboardContent::Image { data, .. } => data.is_empty(),
+        }
+    }
+
+    /// Lazily register and cache the "PNG" clipboard format ID.
+    /// Returns 0 if registration fails.
+    fn png_format_id() -> u32 {
+        static PNG_ID: OnceLock<u32> = OnceLock::new();
+        *PNG_ID.get_or_init(|| {
+            clipboard_win::register_format("PNG")
+                .map(|nz| nz.get())
+                .unwrap_or(0)
+        })
+    }
+
+    /// Convert arbitrary image bytes (PNG, JPEG, etc.) to a complete BMP file.
+    /// `set_bitmap` expects a full BMP (BITMAPFILEHEADER + BITMAPINFOHEADER + pixels),
+    /// which it uses to create an HBITMAP via `CreateDIBitmap`.
+    ///
+    /// NOTE: We encode as 24-bit RGB (`BI_RGB`), not 32-bit RGBA.
+    /// `clipboard-win`'s `set_bitmap` copies only a fixed 40-byte `BITMAPINFOHEADER`
+    /// to pass as `BITMAPINFO*` to `CreateDIBitmap`.  32-bit RGBA would produce
+    /// `BI_BITFIELDS` headers with color masks after the info header, which
+    /// `set_bitmap` does not include, causing `CreateDIBitmap` to fail.
+    fn convert_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
+        let img = image::load_from_memory(data).ok()?;
+        let rgb = img.to_rgb8();
+        let (w, h) = (rgb.width(), rgb.height());
+
+        let mut bmp = Vec::new();
+        {
+            let mut enc = BmpEncoder::new(&mut bmp);
+            enc.encode(&rgb, w, h, ExtendedColorType::Rgb8).ok()?;
+        }
+
+        (bmp.len() > 14).then_some(bmp)
+    }
+
+    /// Convert raw CF_DIBV5 clipboard data to a complete BMP file.
+    ///
+    /// CF_DIBV5 data layout: `BITMAPV5HEADER` (+ optional color table) + pixels.
+    /// We prepend a BMP file header.  This preserves alpha channel for 32-bit
+    /// images (BI_BITFIELDS with A mask), which CF_BITMAP/CF_DIB cannot.
+    fn dibv5_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
+        // BITMAPV5HEADER is at least 124 bytes; bV5Size is the first DWORD.
+        if data.len() < 4 {
+            return None;
+        }
+        let header_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if header_size < 40 || header_size > data.len() || header_size > 256 {
+            return None;
+        }
+
+        // bfOffBits: BMP file header (14) + DIB header + optional color table.
+        // For >8 bpp images there is no color table, so offset = 14 + header_size.
+        // For ≤8 bpp, the color table is already inside `data` after the header,
+        // so the same formula works — bfOffBits points to pixel data within the
+        // concatenated buffer.
+        let bf_off_bits = (14 + header_size) as u32;
+        let file_size = bf_off_bits + (data.len() - header_size) as u32;
+
+        let mut bmp = Vec::with_capacity(14 + data.len());
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&file_size.to_le_bytes());
+        bmp.extend_from_slice(&[0u8; 4]); // bfReserved1 + bfReserved2
+        bmp.extend_from_slice(&bf_off_bits.to_le_bytes());
+        bmp.extend_from_slice(data);
+        Some(bmp)
+    }
+
+    /// Read clipboard using `get_clipboard` which handles open/close internally.
+    ///
+    /// Priority order:
+    /// 1. Text (Unicode)
+    /// 2. PNG format — compressed, alpha-preserving, used by Chrome/Firefox/Office.
+    ///    This is the preferred image format for wire transfer.
+    /// 3. CF_BITMAP — HBITMAP decoded to BMP by clipboard-win.
+    /// 4. CF_DIBV5 (format 17) — BITMAPV5HEADER, supports alpha channel.
+    /// 5. CF_DIB (format 8) — BITMAPINFOHEADER, some apps only write this.
+    pub fn get_content() -> Option<ClipboardContent> {
+        // ---- Text ----
+        if let Ok(text) = get_clipboard::<String, _>(formats::Unicode) {
+            if !text.is_empty() {
+                return Some(ClipboardContent::Text(text));
+            }
+        }
+
+        // ---- PNG (preferred: compressed, lossless, alpha-capable) ----
+        let png_id = png_format_id();
+        if png_id != 0 {
+            if let Ok(data) = get_clipboard::<Vec<u8>, _>(formats::RawData(png_id)) {
+                if !data.is_empty() {
+                    return Some(ClipboardContent::Image {
+                        mime_type: "image/png".into(),
+                        data,
+                    });
+                }
+            }
+        }
+
+        // ---- CF_BITMAP: HBITMAP → BMP (handled by clipboard-win's `get_bitmap`) ----
+        if let Ok(data) = get_clipboard::<Vec<u8>, _>(formats::Bitmap) {
+            if !data.is_empty() {
+                return Some(ClipboardContent::Image {
+                    mime_type: "image/bmp".into(),
+                    data,
+                });
+            }
+        }
+
+        // ---- CF_DIBV5 (17): BITMAPV5HEADER + pixels, supports alpha ----
+        if let Ok(data) = get_clipboard::<Vec<u8>, _>(formats::RawData(17)) {
+            if !data.is_empty() {
+                if let Some(bmp) = dibv5_to_bmp(&data) {
+                    return Some(ClipboardContent::Image {
+                        mime_type: "image/bmp".into(),
+                        data: bmp,
+                    });
+                }
+            }
+        }
+
+        // ---- CF_DIB (8): raw DIB data (BITMAPINFOHEADER + pixels) ----
+        // Some apps put images here exclusively. Prepend a BMP file header so
+        // the wire format stays consistent.
+        if let Ok(mut data) = get_clipboard::<Vec<u8>, _>(formats::RawData(8)) {
+            if !data.is_empty() {
+                let file_size = (14 + data.len()) as u32;
+                let mut bmp = Vec::with_capacity(14 + data.len());
+                bmp.extend_from_slice(b"BM");
+                bmp.extend_from_slice(&file_size.to_le_bytes());
+                bmp.extend_from_slice(&[0u8; 4]); // reserved
+                bmp.extend_from_slice(&54u32.to_le_bytes()); // bfOffBits
+                bmp.append(&mut data);
+                return Some(ClipboardContent::Image {
+                    mime_type: "image/bmp".into(),
+                    data: bmp,
+                });
+            }
+        }
+        None
+    }
+
+    /// Convert image bytes to PNG.  Returns `data` as-is if already PNG;
+    /// otherwise decodes and re-encodes as PNG.
+    fn ensure_png(data: &[u8], mime_type: &str) -> Option<Vec<u8>> {
+        if mime_type == "image/png" {
+            // Quick check: PNG magic bytes.
+            if data.len() >= 8 && &data[..8] == b"\x89PNG\r\n\x1a\n" {
+                return Some(data.to_vec());
+            }
+        }
+        let img = image::load_from_memory(data).ok()?;
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .ok()?;
+        Some(buf)
+    }
+
+    pub fn set_content(content: ClipboardContent) {
+        if content_is_empty(&content) {
+            return;
+        }
+        match content {
+            ClipboardContent::Text(s) => {
+                if let Err(e) = set_clipboard_string(&s) {
+                    log::error!("Failed to set text clipboard: {e}");
+                }
+            }
+            ClipboardContent::Image { mime_type, data } => {
+                // `new_attempts` opens the clipboard; dropping `_clip` closes it.
+                // NOTE: clipboard-win's `write_clipboard` calls `EmptyClipboard()`
+                // internally, so each write replaces the previous. We write PNG
+                // first (our preferred sync format), then fall back to BMP.
+                let _clip = Clipboard::new_attempts(10);
+
+                // 1. Prefer PNG: compressed, lossless, preserves alpha.
+                let png_id = png_format_id();
+                if png_id != 0 {
+                    if let Some(png_data) = ensure_png(&data, &mime_type) {
+                        if formats::RawData(png_id).write_clipboard(&png_data).is_ok() {
+                            log::debug!(
+                                "Wrote PNG to clipboard ({} bytes, from {mime_type})",
+                                png_data.len()
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                // 2. Fall back to BMP (e.g. PNG format not available, or conversion
+                //    failed).  `formats::Bitmap.write_clipboard` expects a complete
+                //    BMP file (header + info + pixels).
+                if formats::Bitmap.write_clipboard(&data).is_err() {
+                    log::debug!(
+                        "Direct bitmap write failed, attempting format conversion ({mime_type} -> BMP)"
+                    );
+                    match convert_to_bmp(&data) {
+                        Some(bmp) => {
+                            if let Err(e) = formats::Bitmap.write_clipboard(&bmp) {
+                                log::error!("Converted BMP write also failed: {e}");
+                            } else {
+                                log::debug!("Converted image to BMP ({} bytes)", bmp.len());
+                            }
+                        }
+                        None => {
+                            log::error!("Could not decode image, registering raw format");
+                            if let Some(fid) = clipboard_win::register_format(&mime_type) {
+                                let _ = formats::RawData(fid.get()).write_clipboard(&data);
+                            }
+                        }
+                    }
+                } else {
+                    log::debug!("Set image clipboard via BMP ({} bytes)", data.len());
+                }
+            }
+        }
+    }
+
+    pub fn start_monitor(sender: Sender<ClipboardContent>) {
+        thread::spawn(move || {
+            let mut monitor = match Monitor::new() {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("Failed to create clipboard monitor: {e}");
+                    return;
+                }
+            };
+
+            log::info!("Windows clipboard monitor started");
+
+            loop {
+                match monitor.recv() {
+                    Ok(true) => {
+                        if let Some(content) = get_content() {
+                            log::debug!("Clipboard changed: {:?}", content);
+                            if sender.send(content).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(false) => break,
+                    Err(e) => {
+                        log::error!("Clipboard monitor error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Read content from clipboard once.
+    pub fn read_once() -> Option<ClipboardContent> {
+        get_content()
+    }
+}
+
+// ---- Common interface re-exports ----
+
+pub use platform::{read_once, set_content, start_monitor};
