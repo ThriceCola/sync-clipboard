@@ -36,11 +36,11 @@ jobs:
             archive_cmd: 7z a
 
     env:
-      PROJECT_NAME: ${{ github.event.repository.name }} # 默认使用仓库名，可自行修改
+      PROJECT_NAME: ${{ github.event.repository.name }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6 # ← 更新到 v6 (支持 Node 24)
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -79,7 +79,7 @@ jobs:
           ${{ matrix.archive_cmd }} ${{ env.PROJECT_NAME }}-${{ steps.version.outputs.VERSION }}-${{ matrix.os_name }}.${{ matrix.archive_ext }} ${{ env.PROJECT_NAME }}${{ matrix.extension }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v8 # v4 仍然可用，最新版也可换成 v8
         with:
           name: ${{ env.PROJECT_NAME }}-${{ steps.version.outputs.VERSION }}-${{ matrix.os_name }}
           path: release/${{ env.PROJECT_NAME }}-${{ steps.version.outputs.VERSION }}-${{ matrix.os_name }}.${{ matrix.archive_ext }}
@@ -90,12 +90,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8 # 可升级到 v8
         with:
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3 # ← 更新到 v3 (支持 Node 24)
         with:
           tag_name: ${{ github.event.inputs.tag_name || steps.version.outputs.VERSION || format('v{0}', github.sha) }}
           name: ${{ github.event.inputs.release_name || 'Automated Release' }}
