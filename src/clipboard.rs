@@ -13,6 +13,7 @@ use std::sync::mpsc::Sender;
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
+    use std::io::Cursor;
     use std::thread;
     use wayland_clipboard_listener::{
         ClipBoardListenContext, WlClipboardCopyStream, WlClipboardPasteStream, WlListenType,
@@ -56,6 +57,19 @@ mod platform {
         }
     }
 
+    /// Convert image data to PNG format.
+    /// The wayland-clipboard-listener crate's dispatch only writes data to the
+    /// paste fd when the requested mime type is exactly "text/plain;charset=utf-8"
+    /// or "image/png". For images in any other format we must convert to PNG
+    /// first, otherwise the paste target receives nothing (empty clipboard).
+    fn convert_to_png(data: &[u8]) -> Option<Vec<u8>> {
+        let img = image::load_from_memory(data).ok()?;
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .ok()?;
+        Some(png)
+    }
+
     pub fn set_content(content: ClipboardContent) {
         if content_is_empty(&content) {
             return;
@@ -72,14 +86,37 @@ mod platform {
             let result = match &content {
                 ClipboardContent::Text(s) => {
                     let data = s.as_bytes().to_vec();
+                    // Must offer text/plain;charset=utf-8 because the crate's
+                    // dispatch handler only writes data when the requested mime
+                    // type matches TEXT ("text/plain;charset=utf-8") exactly.
                     stream.copy_to_clipboard(
                         data,
-                        vec!["UTF8_STRING", "TEXT", "STRING", "text/plain"],
+                        vec![
+                            "UTF8_STRING",
+                            "TEXT",
+                            "STRING",
+                            "text/plain;charset=utf-8",
+                            "text/plain",
+                        ],
                         false,
                     )
                 }
-                ClipboardContent::Image { mime_type, data } => {
-                    stream.copy_to_clipboard(data.clone(), vec![mime_type.as_str()], false)
+                ClipboardContent::Image { data, .. } => {
+                    // Convert to PNG first — the crate's dispatch only matches
+                    // IMAGE ("image/png") and silently drops every other mime.
+                    match convert_to_png(data) {
+                        Some(png) => {
+                            log::debug!(
+                                "Converted image to PNG for clipboard ({} bytes)",
+                                png.len()
+                            );
+                            stream.copy_to_clipboard(png, vec!["image/png"], false)
+                        }
+                        None => {
+                            log::error!("Failed to convert image to PNG; clipboard will be empty");
+                            return;
+                        }
+                    }
                 }
             };
 
