@@ -149,7 +149,7 @@ journalctl --user -u sync-clipboard.service -f
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourname/sync-clipboard.git
+git clone git@github.com:ThriceCola/sync-clipboard.git
 cd sync-clipboard
 
 # 编译（Linux Or Windows）

@@ -149,7 +149,7 @@ Both **text** and **image** clipboard content are supported. On Windows, images 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourname/sync-clipboard.git
+git clone git@github.com:ThriceCola/sync-clipboard.git
 cd sync-clipboard
 
 # Build (Linux Or Windows)
