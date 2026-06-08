@@ -86,20 +86,14 @@ mod platform {
             let result = match &content {
                 ClipboardContent::Text(s) => {
                     let data = s.as_bytes().to_vec();
-                    // Must offer text/plain;charset=utf-8 because the crate's
-                    // dispatch handler only writes data when the requested mime
-                    // type matches TEXT ("text/plain;charset=utf-8") exactly.
-                    stream.copy_to_clipboard(
-                        data,
-                        vec![
-                            "UTF8_STRING",
-                            "TEXT",
-                            "STRING",
-                            "text/plain;charset=utf-8",
-                            "text/plain",
-                        ],
-                        false,
-                    )
+                    // The crate's Send dispatch handler (dispatch.rs) only
+                    // writes data when the requested mime equals TEXT
+                    // ("text/plain;charset=utf-8") or IMAGE ("image/png")
+                    // exactly.  Offering additional mime types (UTF8_STRING,
+                    // TEXT, STRING, text/plain) causes apps that request
+                    // those to receive empty data — the fd is never written.
+                    // Only offer the mime type the library actually serves.
+                    stream.copy_to_clipboard(data, vec!["text/plain;charset=utf-8"], false)
                 }
                 ClipboardContent::Image { data, .. } => {
                     // Convert to PNG first — the crate's dispatch only matches
