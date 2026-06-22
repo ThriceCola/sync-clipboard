@@ -35,6 +35,53 @@ mod platform {
             || mime == "UTF8_STRING"
     }
 
+    fn is_image_mime(mime: &str) -> bool {
+        mime.starts_with("image/")
+    }
+
+    /// Detect image format from magic bytes. Returns the MIME type if detected.
+    fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
+        if data.len() < 4 {
+            return None;
+        }
+        if &data[..4] == b"\x89PNG" {
+            return Some("image/png");
+        }
+        if &data[..2] == b"\xff\xd8" {
+            return Some("image/jpeg");
+        }
+        if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+            return Some("image/webp");
+        }
+        if &data[..4] == b"GIF8" {
+            return Some("image/gif");
+        }
+        if &data[..2] == b"BM" {
+            return Some("image/bmp");
+        }
+        None
+    }
+
+    /// Priority list for MIME type selection. The crate picks the first matching
+    /// entry from this list that is offered by the clipboard source. Image and
+    /// text types come first to avoid picking metadata types like
+    /// `application/x-kde-suggestedfilename`.
+    const MIME_PRIORITY: &[&str] = &[
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/bmp",
+        "image/x-bmp",
+        "image/tiff",
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "TEXT",
+        "STRING",
+        "text/html",
+    ];
+
     fn context_to_content(ctx: ClipBoardListenContext) -> Option<ClipboardContent> {
         if ctx.context.is_empty() {
             return None;
@@ -42,11 +89,30 @@ mod platform {
         if is_text_mime(&ctx.mime_type) {
             let text = String::from_utf8_lossy(&ctx.context).to_string();
             Some(ClipboardContent::Text(text))
-        } else {
+        } else if is_image_mime(&ctx.mime_type) {
             Some(ClipboardContent::Image {
                 mime_type: ctx.mime_type,
                 data: ctx.context,
             })
+        } else if let Some(detected_mime) = detect_image_mime(&ctx.context) {
+            // MIME type not recognized (e.g. application/x-kde-suggestedfilename),
+            // but the data looks like an image. Treat it as one.
+            log::debug!(
+                "MIME type '{}' not recognized, but data looks like {detected_mime} ({} bytes)",
+                ctx.mime_type,
+                ctx.context.len()
+            );
+            Some(ClipboardContent::Image {
+                mime_type: detected_mime.to_string(),
+                data: ctx.context,
+            })
+        } else {
+            log::debug!(
+                "Ignoring unsupported clipboard mime type: {} ({} bytes)",
+                ctx.mime_type,
+                ctx.context.len()
+            );
+            None
         }
     }
 
@@ -130,6 +196,10 @@ mod platform {
                 }
             };
 
+            // Set MIME type priority so we pick image/text over metadata types
+            // like application/x-kde-suggestedfilename.
+            stream.set_priority(MIME_PRIORITY.iter().map(|s| s.to_string()).collect());
+
             log::info!("Wayland clipboard monitor started");
 
             for msg in stream.paste_stream().flatten() {
@@ -147,6 +217,9 @@ mod platform {
     /// Read content from clipboard once (used for dedup after remote set).
     pub fn read_once() -> Option<ClipboardContent> {
         let mut stream = WlClipboardPasteStream::init(WlListenType::ListenOnCopy).ok()?;
+        // Set MIME type priority so we pick image/text over metadata types
+        // like application/x-kde-suggestedfilename.
+        stream.set_priority(MIME_PRIORITY.iter().map(|s| s.to_string()).collect());
         let msg = stream.get_clipboard().ok()?;
         context_to_content(msg.context)
     }
@@ -196,12 +269,22 @@ mod platform {
     pub fn get_content() -> Option<ClipboardContent> {
         if let Ok(text) = get_clipboard::<String, _>(formats::Unicode) {
             if !text.is_empty() {
+                log::debug!(
+                    "Read clipboard: Unicode text ({} chars)",
+                    text.chars().count()
+                );
                 return Some(ClipboardContent::Text(text));
             }
         }
         // CF_BITMAP: HBITMAP → BMP (handled by clipboard-win's `get_bitmap`)
         if let Ok(data) = get_clipboard::<Vec<u8>, _>(formats::Bitmap) {
             if !data.is_empty() {
+                let preview_len = data.len().min(16);
+                log::debug!(
+                    "Read clipboard: CF_BITMAP ({} bytes, first={:02x?})",
+                    data.len(),
+                    &data[..preview_len]
+                );
                 return Some(ClipboardContent::Image {
                     mime_type: "image/bmp".into(),
                     data,
@@ -213,6 +296,12 @@ mod platform {
         // the wire format stays consistent.
         if let Ok(mut data) = get_clipboard::<Vec<u8>, _>(formats::RawData(8)) {
             if !data.is_empty() {
+                let preview_len = data.len().min(16);
+                log::debug!(
+                    "Read clipboard: CF_DIB ({} bytes, first={:02x?})",
+                    data.len(),
+                    &data[..preview_len]
+                );
                 // DIB = BITMAPINFOHEADER + pixels.
                 // BMP file header: "BM" + file_size + reserved(4) + data_offset(54).
                 let file_size = (14 + data.len()) as u32;
@@ -228,6 +317,7 @@ mod platform {
                 });
             }
         }
+        log::debug!("Read clipboard: empty or unsupported format");
         None
     }
 
@@ -242,6 +332,14 @@ mod platform {
                 }
             }
             ClipboardContent::Image { mime_type, data } => {
+                // Diagnostic: log what we're about to write.
+                let preview_len = data.len().min(64);
+                log::info!(
+                    "Setting image: mime={mime_type}, data_len={}, first_bytes={:02x?}",
+                    data.len(),
+                    &data[..preview_len]
+                );
+
                 // `new_attempts` opens the clipboard; dropping `_clip` closes it.
                 let _clip = Clipboard::new_attempts(10);
 
@@ -263,7 +361,10 @@ mod platform {
                             }
                         }
                         None => {
-                            log::error!("Could not decode image, registering raw format");
+                            log::error!(
+                                "Could not decode image (mime={mime_type}, data_len={}), registering raw format",
+                                data.len()
+                            );
                             if let Some(fid) = clipboard_win::register_format(&mime_type) {
                                 let _ = formats::RawData(fid.get()).write_clipboard(&data);
                             }

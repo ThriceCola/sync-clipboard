@@ -1,9 +1,37 @@
 //! Synchronize clipboard between machines over WebSocket.
-//!
-//! Usage:
-//!   sync-clipboard --listen 0.0.0.0:9000
-//!   sync-clipboard --listen 0.0.0.0:9000 --connect 192.168.1.100:9000
 
+/// Detect image format from magic bytes.
+fn detect_image_format(data: &[u8]) -> &'static str {
+    if data.len() < 4 {
+        return "too short";
+    }
+    if &data[..2] == b"BM" {
+        return "BMP";
+    }
+    if &data[..4] == b"\x89PNG" {
+        return "PNG";
+    }
+    if &data[..2] == b"\xff\xd8" {
+        return "JPEG";
+    }
+    if &data[..4] == b"RIFF" && data.len() >= 12 && &data[8..12] == b"WEBP" {
+        return "WebP";
+    }
+    if &data[..4] == b"GIF8" {
+        return "GIF";
+    }
+    if &data[..4] == b"\x00\x00\x01\x00" {
+        return "ICO";
+    }
+    // DIB header starts with BITMAPINFOHEADER size (40 = 0x28)
+    if data.len() >= 4 && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == 40 {
+        return "DIB (BITMAPINFOHEADER)";
+    }
+    "unknown"
+}
+/// Usage:
+///   sync-clipboard --listen 0.0.0.0:9000
+///   sync-clipboard --listen 0.0.0.0:9000 --connect 192.168.1.100:9000
 mod clipboard;
 mod message;
 mod sync;
@@ -29,6 +57,10 @@ struct Cli {
     /// Enable verbose logging.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Debug: read and print current clipboard content, then exit.
+    #[arg(long)]
+    debug_clipboard: bool,
 }
 
 #[tokio::main]
@@ -45,6 +77,44 @@ async fn main() -> anyhow::Result<()> {
     log::info!("Listening on: {}", cli.listen);
     if !cli.connect.is_empty() {
         log::info!("Peers: {:?}", cli.connect);
+    }
+
+    // Debug mode: read clipboard once, print details, and exit.
+    if cli.debug_clipboard {
+        match clipboard::read_once() {
+            Some(content) => {
+                println!("Clipboard content:");
+                match &content {
+                    message::ClipboardContent::Text(s) => {
+                        println!("  Type: Text");
+                        println!("  Length: {} chars", s.chars().count());
+                        let preview: String = s.chars().take(200).collect();
+                        println!("  Preview: {preview}");
+                    }
+                    message::ClipboardContent::Image { mime_type, data } => {
+                        println!("  Type: Image");
+                        println!("  MIME: {mime_type}");
+                        println!("  Data length: {} bytes", data.len());
+                        let preview_len = data.len().min(128);
+                        println!(
+                            "  First {} bytes: {:02x?}",
+                            preview_len,
+                            &data[..preview_len]
+                        );
+                        // Try to detect the actual format from magic bytes.
+                        let format_hint = detect_image_format(data);
+                        println!("  Detected format: {format_hint}");
+                    }
+                }
+                let hash = content.hash();
+                let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+                println!("  SHA-256: {hash_hex}");
+            }
+            None => {
+                println!("Clipboard is empty or could not be read.");
+            }
+        }
+        return Ok(());
     }
 
     // Start clipboard monitor (platform-specific).

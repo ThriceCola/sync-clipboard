@@ -119,10 +119,17 @@ impl SyncCoordinator {
 
         // Apply to local clipboard.
         log::info!(
-            "Applying remote clipboard change ({} bytes)",
+            "Applying remote clipboard change: {}",
             match &event.content {
-                ClipboardContent::Text(s) => s.len(),
-                ClipboardContent::Image { data, .. } => data.len(),
+                ClipboardContent::Text(s) => format!("Text ({} chars)", s.chars().count()),
+                ClipboardContent::Image { mime_type, data } => {
+                    let preview_len = data.len().min(32);
+                    format!(
+                        "Image mime={mime_type}, data_len={}, first_bytes={:02x?}",
+                        data.len(),
+                        &data[..preview_len]
+                    )
+                }
             }
         );
 
@@ -185,10 +192,13 @@ impl SyncCoordinator {
         }
 
         log::info!(
-            "Local clipboard changed, broadcasting ({} bytes)",
+            "Local clipboard changed, broadcasting: {}",
             match &content {
-                ClipboardContent::Text(s) => s.len(),
-                ClipboardContent::Image { data, .. } => data.len(),
+                ClipboardContent::Text(s) => format!("Text ({} chars)", s.chars().count()),
+                ClipboardContent::Image { mime_type, data } => format!(
+                    "Image mime={mime_type}, {data_len} bytes",
+                    data_len = data.len()
+                ),
             }
         );
 
