@@ -83,21 +83,12 @@ ExecStart=/home/yourusername/path/sync-clipboard \
 Restart=always
 RestartSec=5
 StandardOutput=journal
-# Wayland environment variables — not set by default in the systemd service environment
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_RUNTIME_DIR=/run/user/%U
 
 [Install]
 WantedBy=graphical-session.target
 ```
 
-First verify your Wayland display name (usually `wayland-0` or `wayland-1`):
-
-```bash
-echo $WAYLAND_DISPLAY
-```
-
-If the output is not `wayland-0`, change `wayland-0` in the service file to the actual value.
+Do not set `WAYLAND_DISPLAY`. The program uses the variable when it already points at a live socket. Otherwise it searches `$XDG_RUNTIME_DIR` for `wayland-N`. systemd user services already provide `XDG_RUNTIME_DIR`.
 
 Enable and start:
 

@@ -81,21 +81,12 @@ ExecStart=/home/你的用户名/路径/sync-clipboard \
 Restart=always
 RestartSec=5
 StandardOutput=journal
-# Wayland 环境变量 —— systemd 服务环境中默认没有这些，需要手动设置
-Environment=WAYLAND_DISPLAY=wayland-0
-Environment=XDG_RUNTIME_DIR=/run/user/%U
 
 [Install]
 WantedBy=graphical-session.target
 ```
 
-先确认你的 Wayland display 名称（通常是 `wayland-0` 或 `wayland-1`）：
-
-```bash
-echo $WAYLAND_DISPLAY
-```
-
-如果输出不是 `wayland-0`，请把上面 service 文件里的 `wayland-0` 改成实际的值。
+不需要设置 `WAYLAND_DISPLAY`。程序会使用已有的值；如果没设置，或指向的 socket 不存在，就在 `$XDG_RUNTIME_DIR` 里自动寻找 `wayland-N`。systemd 用户服务自带 `XDG_RUNTIME_DIR`。
 
 启用并启动：
 

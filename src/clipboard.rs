@@ -14,10 +14,135 @@ use std::sync::mpsc::Sender;
 mod platform {
     use super::*;
     use std::io::Cursor;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::thread;
     use wayland_clipboard_listener::{
         ClipBoardListenContext, WlClipboardCopyStream, WlClipboardPasteStream, WlListenType,
     };
+
+    /// Pick a live Wayland socket and publish it as `WAYLAND_DISPLAY`.
+    ///
+    /// `wayland-clipboard-listener` only connects through that variable. A user
+    /// service often has it unset or pinned to a socket that does not exist
+    /// (Plasma frequently uses `wayland-1` rather than `wayland-0`).
+    fn ensure_wayland_display() {
+        static RESOLVED: Mutex<bool> = Mutex::new(false);
+        let mut resolved = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+        if *resolved {
+            return;
+        }
+        if resolve_wayland_display().is_some() {
+            *resolved = true;
+        }
+    }
+
+    fn resolve_wayland_display() -> Option<String> {
+        let runtime = xdg_runtime_dir();
+        if let Some(current) = std::env::var_os("WAYLAND_DISPLAY") {
+            let path = display_socket_path(&runtime, &current);
+            if socket_connectable(&path) {
+                log::debug!("Using Wayland display {}", path.display());
+                return Some(current.to_string_lossy().into_owned());
+            }
+            log::warn!(
+                "WAYLAND_DISPLAY={} is not a live socket, searching {}",
+                current.to_string_lossy(),
+                runtime.display()
+            );
+        }
+
+        let mut sockets = wayland_sockets(&runtime);
+        sockets.retain(|name| socket_connectable(&runtime.join(name)));
+        if sockets.is_empty() {
+            log::error!(
+                "No Wayland socket found in {} (expected wayland-N)",
+                runtime.display()
+            );
+            return None;
+        }
+        if sockets.len() > 1 {
+            log::info!(
+                "Multiple Wayland sockets ({}); using the most recently modified",
+                sockets.join(", ")
+            );
+        }
+        let chosen = sockets
+            .into_iter()
+            .max_by_key(|name| {
+                std::fs::metadata(runtime.join(name))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+            .expect("sockets is non-empty");
+        log::info!("Auto-selected Wayland display {chosen}");
+        // SAFETY: `std::env::set_var` is process-global. Callers serialize this
+        // through `RESOLVED`, and it runs before `connect_to_env` reads the variable.
+        unsafe { std::env::set_var("WAYLAND_DISPLAY", &chosen) };
+        Some(chosen)
+    }
+
+    fn xdg_runtime_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let path = PathBuf::from(dir);
+            if path.is_absolute() {
+                return path;
+            }
+        }
+        let uid = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    let rest = line.strip_prefix("Uid:")?;
+                    rest.split_whitespace().next()?.parse::<u32>().ok()
+                })
+            })
+            .unwrap_or(0);
+        PathBuf::from(format!("/run/user/{uid}"))
+    }
+
+    fn display_socket_path(runtime: &Path, display: &std::ffi::OsStr) -> PathBuf {
+        let path = PathBuf::from(display);
+        if path.is_absolute() {
+            path
+        } else {
+            runtime.join(path)
+        }
+    }
+
+    fn socket_connectable(path: &Path) -> bool {
+        UnixStream::connect(path).is_ok()
+    }
+
+    /// `wayland-0`, `wayland-1`, … — skip `wayland-1.lock` and non-sockets.
+    fn wayland_sockets(runtime: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(entries) = std::fs::read_dir(runtime) else {
+            return names;
+        };
+        for entry in entries.flatten() {
+            let os_name = entry.file_name();
+            let Some(name) = os_name.to_str() else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix("wayland-") else {
+                continue;
+            };
+            if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_socket() {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        names
+    }
 
     const TEXT_MIMES: &[&str] = &[
         "UTF8_STRING",
@@ -141,6 +266,7 @@ mod platform {
             return;
         }
         thread::spawn(move || {
+            ensure_wayland_display();
             let mut stream = match WlClipboardCopyStream::init() {
                 Ok(s) => s,
                 Err(e) => {
@@ -188,6 +314,7 @@ mod platform {
 
     pub fn start_monitor(sender: Sender<ClipboardContent>) {
         thread::spawn(move || {
+            ensure_wayland_display();
             let mut stream = match WlClipboardPasteStream::init(WlListenType::ListenOnCopy) {
                 Ok(s) => s,
                 Err(e) => {
@@ -216,6 +343,7 @@ mod platform {
 
     /// Read content from clipboard once (used for dedup after remote set).
     pub fn read_once() -> Option<ClipboardContent> {
+        ensure_wayland_display();
         let mut stream = WlClipboardPasteStream::init(WlListenType::ListenOnCopy).ok()?;
         // Set MIME type priority so we pick image/text over metadata types
         // like application/x-kde-suggestedfilename.
